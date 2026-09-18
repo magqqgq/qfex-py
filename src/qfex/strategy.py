@@ -15,10 +15,14 @@ class TakerStrategy:
         self.client = client
 
     async def on_bbo(self, bbo: "BBO") -> None:
-        pass
+        raise NotImplementedError(
+            "on_bbo() must be implemented in a TakerStrategy subclass"
+        )
 
     async def on_trade(self, trade_msg: Dict[str, Any]) -> None:
-        pass
+        raise NotImplementedError(
+            "on_trade() must be implemented in a TakerStrategy subclass"
+        )
 
     async def on_fill(self, fill: Dict[str, Any]) -> None:
         """
@@ -28,4 +32,6 @@ class TakerStrategy:
           - filled_qty_delta (Decimal)
           - filled_notional_delta (Decimal)
         """
-        pass
+        raise NotImplementedError(
+            "on_fill() must be implemented in a TakerStrategy subclass"
+        )

@@ -6,6 +6,7 @@ import logging
 import random
 import secrets
 import time
+import urllib.parse
 from decimal import Decimal
 from typing import Any, Dict, Optional, Tuple, List
 
@@ -19,7 +20,15 @@ from .strategy import TakerStrategy
 
 
 class QFEXTakerClient:
-    def __init__(self, cfg: QFEXConfig, strategy: TakerStrategy):
+    def __init__(
+        self, cfg: QFEXConfig, strategy: Optional[TakerStrategy] = None
+    ):
+        """
+        Create a QFEXTakerClient.
+
+        The strategy is optional so it can be constructed with a client
+        reference and bound later via set_strategy().
+        """
         self.cfg = cfg
         self.strategy = strategy
 
@@ -56,6 +65,10 @@ class QFEXTakerClient:
         self._trade_ws: Optional[ClientConnection] = None
 
     # ---------- Public API ----------
+
+    def set_strategy(self, strategy: TakerStrategy) -> None:
+        """Bind a TakerStrategy to this client (typically done after construction)."""
+        self.strategy = strategy
 
     async def __aenter__(self) -> "QFEXTakerClient":
         self.log.info(
@@ -130,8 +143,11 @@ class QFEXTakerClient:
                 "side": side.value,
                 "order_type": OrderType.LIMIT.value,
                 "order_time_in_force": TimeInForce.IOC.value,
-                "quantity": float(quantity),
-                "price": float(price),
+                # Serialize quantity/price as strings to preserve exact decimal
+                # values; the server parses these with Decimal(str(...)), so
+                # strings are safe in this wire format.
+                "quantity": str(quantity),
+                "price": str(price),
                 "take_profit": 0,
                 "stop_loss": 0,
                 "client_order_id": client_oid,
@@ -142,6 +158,16 @@ class QFEXTakerClient:
 
         try:
             return await asyncio.wait_for(fut, timeout=self.cfg.order_update_timeout_s)
+        except asyncio.TimeoutError:
+            # The order may still be live even though no terminal response arrived
+            # within order_update_timeout_s. Return a partial result keyed by
+            # client_order_id so the caller can track the order; server-side
+            # idempotent dedup by client_order_id keeps retries safe.
+            return {
+                "timed_out": True,
+                "client_order_id": client_oid,
+                "final_order_response": None,
+            }
         finally:
             self._client_oid_to_fut.pop(client_oid, None)
 
@@ -163,6 +189,9 @@ class QFEXTakerClient:
         return f"wss://mds.{self._domain()}"
 
     def _trade_url(self) -> str:
+        # The API key in the query string is deprecated and kept for backward
+        # compatibility only; the credentials are actually sent in the auth
+        # message (_build_auth_message), so the key must never be logged.
         return f"wss://trade.{self._domain()}?api_key={self.cfg.public_key}"
 
     def _build_auth_message(self) -> Dict[str, Any]:
@@ -324,7 +353,10 @@ class QFEXTakerClient:
 
     async def _trade_session(self) -> None:
         url = self._trade_url()
-        self.log.info("connecting trade: %s", url)
+        # Strip the query string before logging so the api_key is never exposed.
+        u = urllib.parse.urlsplit(url)
+        safe_url = urllib.parse.urlunsplit((u.scheme, u.netloc, u.path, "", ""))
+        self.log.info("connecting trade: %s", safe_url)
 
         async with websockets.connect(
             url,
@@ -372,6 +404,15 @@ class QFEXTakerClient:
                 await asyncio.gather(writer, return_exceptions=True)
 
     async def _trade_writer(self, ws: ClientConnection) -> None:
+        """
+        Single writer that flushes outbound trade messages over the websocket.
+
+        On disconnect an undelivered message is re-enqueued and retried after
+        reconnect, which gives at-least-once delivery.
+        NOTE: For ORDER messages the server must idempotently dedupe by
+        client_order_id; otherwise a retried order can be applied twice and
+        duplicate orders may surface.
+        """
         while True:
             msg = await self._trade_out_q.get()
             try:
@@ -478,8 +519,19 @@ class QFEXTakerClient:
                 "BAD_SYMBOL",
                 "FAILED_MARGIN_CHECK",
             )
-            # Also treat FILLED with no remaining as terminal
+            # FILLED with no remaining quantity is fully filled and terminal.
             if status == "FILLED" and remaining == 0:
+                is_terminal = True
+            # Statuses that mean the order may still be live on the exchange.
+            open_statuses = {
+                "OPEN",
+                "NEW",
+                "PENDING",
+                "PARTIALLY_FILLED",
+                "FILLED",
+            }
+            if not is_terminal and status not in open_statuses:
+                # Treat any unrecognised status as terminal to avoid hanging futures.
                 is_terminal = True
             if is_terminal:
                 fut.set_result({"final_order_response": orsp})
