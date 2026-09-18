@@ -299,7 +299,8 @@ class QFEXTakerClient:
             b = self._parse_bbo(msg)
             self._sequence_check("bbo", b.symbol, b.sequence)
             self.bbo_by_symbol[b.symbol] = b
-            await self.strategy.on_bbo(b)
+            if self.strategy:
+                await self.strategy.on_bbo(b)
 
         elif mtype == "trade":
             # public trades stream
@@ -307,7 +308,8 @@ class QFEXTakerClient:
             seq = msg.get("sequence")
             if isinstance(sym, str) and isinstance(seq, int):
                 self._sequence_check("trade", sym, seq)
-            await self.strategy.on_trade(msg)
+            if self.strategy:
+                await self.strategy.on_trade(msg)
 
         else:
             return
@@ -505,7 +507,8 @@ class QFEXTakerClient:
                     "client_order_id": client_oid,
                     "order_id": order_id,
                 }
-                await self.strategy.on_fill(fill_payload)
+                if self.strategy:
+                    await self.strategy.on_fill(fill_payload)
             self._order_last_remaining[order_id] = remaining
 
         # Complete any awaiting future keyed by client_order_id (IOC convenience)
@@ -513,26 +516,43 @@ class QFEXTakerClient:
         if fut and not fut.done():
             is_terminal = status in (
                 "CANCELLED",
+                "CANCELLED_STP",
                 "REJECTED",
                 "NO_SUCH_ORDER",
                 "INVALID_ORDER_TYPE",
                 "BAD_SYMBOL",
                 "FAILED_MARGIN_CHECK",
+                "RATE_LIMITED",
+                "REJECTED_WOULD_BREACH_MAX_NOTIONAL",
+                "CANNOT_MODIFY_NO_SUCH_ORDER",
+                "REJECTED_MARKET_CLOSED",
+                "REJECTED_FAILED_TO_PROCESS",
+                "REJECTED_TOO_MANY_OPEN_ORDERS",
+                "REJECTED_OPEN_INTEREST_LIMIT",
             )
-            # FILLED with no remaining quantity is fully filled and terminal.
+            # FILLED with zero remaining quantity is fully filled and terminal.
             if status == "FILLED" and remaining == 0:
                 is_terminal = True
-            # Statuses that mean the order may still be live on the exchange.
+
+            # Working statuses on QFEX.
+            # "ACK" indicates order acceptance and that the order is now working;
+            # it must NOT resolve the waiter so that the subsequent fill/cancel is captured.
             open_statuses = {
+                "ACK",
                 "OPEN",
                 "NEW",
                 "PENDING",
                 "PARTIALLY_FILLED",
-                "FILLED",
             }
-            if not is_terminal and status not in open_statuses:
-                # Treat any unrecognised status as terminal to avoid hanging futures.
+
+            # A partially filled order with remaining quantity is still live on the book.
+            if status == "FILLED" and remaining > 0:
+                is_terminal = False
+            elif not is_terminal and status not in open_statuses:
+                # Treat any unrecognised status outside known open statuses as terminal
+                # to prevent hanging futures on unexpected final outcomes.
                 is_terminal = True
+
             if is_terminal:
                 fut.set_result({"final_order_response": orsp})
 
